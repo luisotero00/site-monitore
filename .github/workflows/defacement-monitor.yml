@@ -30,7 +30,7 @@ jobs:
           text = re.sub(r'<[^>]+>', ' ', clean)
           text = ' '.join(text.split())
           h = hashlib.sha256(text.encode()).hexdigest()
-          kw = 'true' if 'ciberseguridad 720' not in html.lower() else 'false'
+          kw = 'true' if 'xyz_no_existe_123' not in html.lower() else 'false'
           with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
               out.write(f'hash={h}\n')
               out.write(f'keyword_missing={kw}\n')
