@@ -1,0 +1,108 @@
+name: Defacement Monitor
+
+on:
+  schedule:
+    - cron: '*/15 * * * *'
+  workflow_dispatch:
+    inputs:
+      update_baseline:
+        description: 'Actualizar baseline (usar después de un deploy legítimo)'
+        type: boolean
+        default: false
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fetch y analizar
+        id: fetch
+        run: |
+          mkdir -p .cache
+          HTTP_CODE=$(curl -s -o .cache/page.html -w "%{http_code}" --max-time 30 --retry 2 --retry-delay 5 -L https://ciberseguridad720.com || echo "000")
+          echo "http_code=$HTTP_CODE" >> $GITHUB_OUTPUT
+          if [ "$HTTP_CODE" = "200" ]; then
+            python3 -c "
+          import hashlib, re, os
+          with open('.cache/page.html', encoding='utf-8', errors='ignore') as f:
+              html = f.read()
+          clean = re.sub(r'<script[^>]*>.*?</script>', '', html, flags=re.DOTALL|re.IGNORECASE)
+          clean = re.sub(r'<style[^>]*>.*?</style>', '', clean, flags=re.DOTALL|re.IGNORECASE)
+          text = re.sub(r'<[^>]+>', ' ', clean)
+          text = ' '.join(text.split())
+          h = hashlib.sha256(text.encode()).hexdigest()
+          kw = 'true' if 'ciberseguridad 720' not in html.lower() else 'false'
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
+              out.write(f'hash={h}\n')
+              out.write(f'keyword_missing={kw}\n')
+          "
+          fi
+
+      - name: Restaurar baseline
+        if: steps.fetch.outputs.http_code == '200'
+        uses: actions/cache/restore@v4
+        with:
+          path: .cache/baseline.txt
+          key: baseline-${{ github.run_id }}
+          restore-keys: baseline-
+
+      - name: Comparar y alertar
+        if: steps.fetch.outputs.http_code != ''
+        env:
+          TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
+          HASH: ${{ steps.fetch.outputs.hash }}
+          HTTP_CODE: ${{ steps.fetch.outputs.http_code }}
+          KW_MISSING: ${{ steps.fetch.outputs.keyword_missing }}
+          UPDATE_BL: ${{ inputs.update_baseline }}
+        run: |
+          send() {
+            curl -s -X POST "https://api.telegram.org/bot${TOKEN}/sendMessage" \
+              --data-urlencode "chat_id=${CHAT}" \
+              --data-urlencode "parse_mode=HTML" \
+              --data-urlencode "text=$1" > /dev/null
+          }
+
+          if [ "$HTTP_CODE" != "200" ]; then
+            send "🔴 <b>ciberseguridad720.com CAÍDO</b>
+          HTTP $HTTP_CODE — verificar de inmediato"
+            exit 0
+          fi
+
+          if [ "$UPDATE_BL" = "true" ]; then
+            echo "$HASH" > .cache/baseline.txt
+            send "✅ <b>Baseline actualizada</b>
+          Hash: ${HASH:0:16}..."
+            exit 0
+          fi
+
+          if [ ! -f .cache/baseline.txt ]; then
+            echo "$HASH" > .cache/baseline.txt
+            send "✅ <b>Monitor activo — ciberseguridad720.com</b>
+          Revisión cada 15 min
+          Baseline: ${HASH:0:16}..."
+            exit 0
+          fi
+
+          BASELINE=$(cat .cache/baseline.txt)
+
+          if [ "$KW_MISSING" = "true" ]; then
+            send "🚨 <b>POSIBLE DEFACEMENT — ciberseguridad720.com</b>
+          Marca 'Ciberseguridad 720' NO encontrada.
+          Verificar YA: https://ciberseguridad720.com"
+            exit 0
+          fi
+
+          if [ "$HASH" != "$BASELINE" ]; then
+            echo "$HASH" > .cache/baseline.txt
+            send "⚠️ <b>Contenido modificado — ciberseguridad720.com</b>
+          Anterior: ${BASELINE:0:16}...
+          Actual: ${HASH:0:16}...
+          Si no fue deploy, investigar."
+          fi
+
+      - name: Guardar cache
+        if: always() && steps.fetch.outputs.http_code == '200'
+        uses: actions/cache/save@v4
+        with:
+          path: .cache/baseline.txt
+          key: baseline-${{ github.run_id }}
