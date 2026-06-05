@@ -59,7 +59,7 @@ jobs:
             curl -s -X POST "https://api.telegram.org/bot${TOKEN}/sendMessage" \
               --data-urlencode "chat_id=${CHAT}" \
               --data-urlencode "parse_mode=HTML" \
-              --data-urlencode "text=$1" > /dev/null
+              --data-urlencode "text=$1" 
           }
 
           if [ "$HTTP_CODE" != "200" ]; then
