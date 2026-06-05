@@ -14,95 +14,201 @@ jobs:
   monitor:
     runs-on: ubuntu-latest
     steps:
-      - name: Fetch y analizar
-        id: fetch
-        run: |
-          mkdir -p .cache
-          HTTP_CODE=$(curl -s -o .cache/page.html -w "%{http_code}" --max-time 30 --retry 2 --retry-delay 5 -L https://ciberseguridad720.com || echo "000")
-          echo "http_code=$HTTP_CODE" >> $GITHUB_OUTPUT
-          if [ "$HTTP_CODE" = "200" ]; then
-            python3 -c "
-          import hashlib, re, os
-          with open('.cache/page.html', encoding='utf-8', errors='ignore') as f:
-              html = f.read()
-          clean = re.sub(r'<script[^>]*>.*?</script>', '', html, flags=re.DOTALL|re.IGNORECASE)
-          clean = re.sub(r'<style[^>]*>.*?</style>', '', clean, flags=re.DOTALL|re.IGNORECASE)
-          text = re.sub(r'<[^>]+>', ' ', clean)
-          text = ' '.join(text.split())
-          h = hashlib.sha256(text.encode()).hexdigest()
-          kw = 'true' if 'xyz_no_existe_123' not in html.lower() else 'false'
-          with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
-              out.write(f'hash={h}\n')
-              out.write(f'keyword_missing={kw}\n')
-          "
-          fi
-
       - name: Restaurar baseline
-        if: steps.fetch.outputs.http_code == '200'
         uses: actions/cache/restore@v4
         with:
-          path: .cache/baseline.txt
-          key: baseline-${{ github.run_id }}
-          restore-keys: baseline-
+          path: .cache/baseline.json
+          key: baseline-v2-${{ github.run_id }}
+          restore-keys: baseline-v2-
 
-      - name: Comparar y alertar
-        if: steps.fetch.outputs.http_code != ''
+      - name: Analizar y alertar
         env:
           TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
-          HASH: ${{ steps.fetch.outputs.hash }}
-          HTTP_CODE: ${{ steps.fetch.outputs.http_code }}
-          KW_MISSING: ${{ steps.fetch.outputs.keyword_missing }}
           UPDATE_BL: ${{ inputs.update_baseline }}
         run: |
-          send() {
-            curl -s -X POST "https://api.telegram.org/bot${TOKEN}/sendMessage" \
-              --data-urlencode "chat_id=${CHAT}" \
-              --data-urlencode "parse_mode=HTML" \
-              --data-urlencode "text=$1" 
+          mkdir -p .cache
+          cat > /tmp/monitor.py << 'PYEOF'
+          import hashlib, re, os, json, time
+          import urllib.request, urllib.parse, ssl, socket
+          from datetime import datetime, timezone, timedelta
+
+          PAGES = {
+              'Home': 'https://ciberseguridad720.com',
+              'Inicio': 'https://www.ciberseguridad720.com/es',
+              'Soluciones': 'https://www.ciberseguridad720.com/es/soluciones',
+              'Nosotros': 'https://www.ciberseguridad720.com/es/sobre-nosotros',
+              'Blog': 'https://www.ciberseguridad720.com/es/blog',
           }
+          KEYWORD = 'ciberseguridad 720'
+          VALID_DOMAINS = ['ciberseguridad720.com', 'www.ciberseguridad720.com']
+          ALLOWED_SCRIPTS = [
+              'ciberseguridad720.com', 'www.ciberseguridad720.com',
+              'challenges.cloudflare.com', 'static.cloudflareinsights.com',
+              'cdn.jsdelivr.net', 'unpkg.com',
+          ]
+          TOKEN = os.environ.get('TOKEN', '')
+          CHAT = os.environ.get('CHAT', '')
+          UPDATE_BL = os.environ.get('UPDATE_BL', 'false')
+          BASELINE_FILE = '.cache/baseline.json'
 
-          if [ "$HTTP_CODE" != "200" ]; then
-            send "🔴 <b>ciberseguridad720.com CAÍDO</b>
-          HTTP $HTTP_CODE — verificar de inmediato"
-            exit 0
-          fi
+          def send(text):
+              data = urllib.parse.urlencode({
+                  'chat_id': CHAT, 'parse_mode': 'HTML', 'text': text
+              }).encode()
+              try:
+                  req = urllib.request.Request(
+                      f'https://api.telegram.org/bot{TOKEN}/sendMessage', data=data
+                  )
+                  urllib.request.urlopen(req, timeout=10)
+              except Exception as e:
+                  print(f'Telegram error: {e}')
 
-          if [ "$UPDATE_BL" = "true" ]; then
-            echo "$HASH" > .cache/baseline.txt
-            send "✅ <b>Baseline actualizada</b>
-          Hash: ${HASH:0:16}..."
-            exit 0
-          fi
+          def load_bl():
+              try:
+                  with open(BASELINE_FILE) as f:
+                      return json.load(f)
+              except:
+                  return None
 
-          if [ ! -f .cache/baseline.txt ]; then
-            echo "$HASH" > .cache/baseline.txt
-            send "✅ <b>Monitor activo — ciberseguridad720.com</b>
-          Revisión cada 15 min
-          Baseline: ${HASH:0:16}..."
-            exit 0
-          fi
+          def save_bl(data):
+              with open(BASELINE_FILE, 'w') as f:
+                  json.dump(data, f)
 
-          BASELINE=$(cat .cache/baseline.txt)
+          alerts = []
+          header_info = []
+          page_hashes = {}
+          page_sizes = {}
+          resp_times = []
+          pages_ok = 0
 
-          if [ "$KW_MISSING" = "true" ]; then
-            send "🚨 <b>POSIBLE DEFACEMENT — ciberseguridad720.com</b>
-          Marca 'Ciberseguridad 720' NO encontrada.
-          Verificar YA: https://ciberseguridad720.com"
-            exit 0
-          fi
+          for name, url in PAGES.items():
+              try:
+                  start = time.time()
+                  req = urllib.request.Request(url, headers={'User-Agent': 'CS720-Monitor/1.0'})
+                  with urllib.request.urlopen(req, timeout=30) as r:
+                      elapsed = round(time.time() - start, 2)
+                      html = r.read().decode('utf-8', errors='ignore')
+                      final_url = r.url
+                      status = r.status
+                      hdrs = {k.lower(): v for k, v in r.headers.items()}
 
-          if [ "$HASH" != "$BASELINE" ]; then
-            echo "$HASH" > .cache/baseline.txt
-            send "⚠️ <b>Contenido modificado — ciberseguridad720.com</b>
-          Anterior: ${BASELINE:0:16}...
-          Actual: ${HASH:0:16}...
-          Si no fue deploy, investigar."
-          fi
+                  resp_times.append(elapsed)
+                  if status != 200:
+                      alerts.append(f'🔴 {name}: HTTP {status}')
+                      continue
+
+                  fd = urllib.parse.urlparse(final_url).netloc
+                  if fd not in VALID_DOMAINS:
+                      alerts.append(f'🔀 {name}: redirigido a {fd} (posible DNS hijack)')
+                      continue
+
+                  if elapsed > 5:
+                      alerts.append(f'🐌 {name}: respuesta lenta ({elapsed}s)')
+
+                  if KEYWORD not in html.lower():
+                      alerts.append(f'🚨 {name}: keyword no encontrada (DEFACEMENT)')
+
+                  srcs = re.findall(r'<script[^>]+src=["\x27]([^"\x27]+)', html, re.I)
+                  for src in srcs:
+                      if src.startswith('//'):
+                          src = 'https:' + src
+                      if src.startswith('http'):
+                          sd = urllib.parse.urlparse(src).netloc
+                          if not any(sd == d or sd.endswith('.' + d) for d in ALLOWED_SCRIPTS):
+                              alerts.append(f'💉 {name}: script externo de {sd}')
+
+                  clean = re.sub(r'<script[^>]*>.*?</script>', '', html, flags=re.DOTALL|re.I)
+                  clean = re.sub(r'<style[^>]*>.*?</style>', '', clean, flags=re.DOTALL|re.I)
+                  text = re.sub(r'<[^>]+>', ' ', clean)
+                  text = ' '.join(text.split())
+                  page_hashes[name] = hashlib.sha256(text.encode()).hexdigest()
+                  page_sizes[name] = len(html)
+
+                  missing = [h for h in ['x-frame-options', 'strict-transport-security', 'x-content-type-options']
+                             if h not in hdrs]
+                  if missing:
+                      header_info.append(f'🛡 {name}: sin {", ".join(missing)}')
+
+                  pages_ok += 1
+              except Exception as e:
+                  alerts.append(f'🔴 {name}: {str(e)[:80]}')
+
+          ssl_days = 999
+          try:
+              ctx = ssl.create_default_context()
+              with ctx.wrap_socket(socket.socket(), server_hostname='ciberseguridad720.com') as s:
+                  s.settimeout(10)
+                  s.connect(('ciberseguridad720.com', 443))
+                  cert = s.getpeercert()
+                  exp = datetime.strptime(cert['notAfter'], '%b %d %H:%M:%S %Y %Z')
+                  exp = exp.replace(tzinfo=timezone.utc)
+                  ssl_days = (exp - datetime.now(timezone.utc)).days
+                  if ssl_days < 14:
+                      alerts.append(f'🔐 SSL expira en {ssl_days} días')
+          except:
+              alerts.append('🔐 Error verificando SSL')
+
+          combined = '|'.join(f'{k}:{v}' for k, v in sorted(page_hashes.items()))
+          combined_hash = hashlib.sha256(combined.encode()).hexdigest()
+          avg_resp = round(sum(resp_times) / len(resp_times), 2) if resp_times else 0
+
+          baseline = load_bl()
+
+          if UPDATE_BL == 'true':
+              save_bl({'hash': combined_hash, 'sizes': page_sizes})
+              send(f'✅ <b>Baseline actualizada</b>\nHash: {combined_hash[:16]}...')
+              exit()
+
+          if baseline is None:
+              save_bl({'hash': combined_hash, 'sizes': page_sizes})
+              send(
+                  f'✅ <b>Monitor activo — ciberseguridad720.com</b>\n'
+                  f'Páginas: {pages_ok}/{len(PAGES)}\n'
+                  f'Checks: hash, keyword, SSL, headers, scripts, DNS, tamaño\n'
+                  f'Revisión cada 15 min\n'
+                  f'Reporte diario: 10:00 AM COL\n'
+                  f'Baseline: {combined_hash[:16]}...'
+              )
+              exit()
+
+          has_defacement = any('DEFACEMENT' in a or 'script externo' in a for a in alerts)
+
+          if combined_hash != baseline.get('hash', '') and not has_defacement:
+              alerts.append('⚠️ Contenido modificado (probablemente deploy)')
+              save_bl({'hash': combined_hash, 'sizes': page_sizes})
+
+          bl_sizes = baseline.get('sizes', {})
+          for name, size in page_sizes.items():
+              if name in bl_sizes and bl_sizes[name] > 0:
+                  change = abs(size - bl_sizes[name]) / bl_sizes[name]
+                  if change > 0.5:
+                      pct = round(change * 100)
+                      d = '↑' if size > bl_sizes[name] else '↓'
+                      alerts.append(f'📏 {name}: tamaño {d}{pct}%')
+
+          if alerts:
+              msg = '<b>⚠️ ALERTAS — ciberseguridad720.com</b>\n\n' + '\n'.join(alerts)
+              send(msg)
+
+          now_col = datetime.now(timezone.utc).astimezone(timezone(timedelta(hours=-5)))
+          if now_col.hour == 10 and now_col.minute < 15 and not alerts:
+              report = (
+                  f'📊 <b>Reporte diario — ciberseguridad720.com</b>\n\n'
+                  f'✅ Páginas OK: {pages_ok}/{len(PAGES)}\n'
+                  f'⏱ Respuesta promedio: {avg_resp}s\n'
+                  f'🔐 SSL: {ssl_days} días restantes\n'
+                  f'🔑 Hash: {combined_hash[:16]}...'
+              )
+              if header_info:
+                  report += '\n\n<b>Headers faltantes:</b>\n' + '\n'.join(header_info)
+              send(report)
+          PYEOF
+          python3 /tmp/monitor.py
 
       - name: Guardar cache
-        if: always() && steps.fetch.outputs.http_code == '200'
+        if: always()
         uses: actions/cache/save@v4
         with:
-          path: .cache/baseline.txt
-          key: baseline-${{ github.run_id }}
+          path: .cache/baseline.json
+          key: baseline-v2-${{ github.run_id }}
