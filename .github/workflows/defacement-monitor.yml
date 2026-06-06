@@ -192,7 +192,7 @@ jobs:
               send(msg)
 
           now_col = datetime.now(timezone.utc).astimezone(timezone(timedelta(hours=-5)))
-          if now_col.hour == 10 and now_col.minute < 15 and not alerts:
+          if now_col.hour == 10 and now_col.minute < 59 and not alerts:
               report = (
                   f'📊 <b>Reporte diario — ciberseguridad720.com</b>\n\n'
                   f'✅ Páginas OK: {pages_ok}/{len(PAGES)}\n'
